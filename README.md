@@ -2,6 +2,10 @@
 
 Traffic Control keeps parallel Codex and Claude Code tasks in separate folders and helps you bring finished work together. You name a feature in plain English; the skill finds or creates its worktree and branch.
 
+## Why I made this
+
+I found myself opening multiple coding chats in Claude Code and Codex for the same project. Once several were going, it was hard to remember where each set of changes lived and how to bring them back together. Traffic Control gives each task a name and its own place to work, then helps me merge it when it's ready.
+
 ## Use it
 
 In Codex, say:
