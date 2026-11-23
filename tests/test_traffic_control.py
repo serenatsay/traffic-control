@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import os
@@ -158,6 +159,85 @@ class TrafficControlTests(GitFixture):
         self.assertTrue(task_folder.is_dir())
         self.assertEqual(self.cli(self.repo, "status")["tasks"][0]["state"], "merged")
 
+    def test_merge_can_resume_and_merge_more_work_in_the_same_worktree(self) -> None:
+        task = self.cli(self.repo, "start", "Grammar quiz")
+        folder = Path(task["folder"])
+        self.commit(folder, "first.txt", "first round\n", "First round")
+        self.cli(self.repo, "merge", task["id"], "--apply")
+
+        resumed = self.cli(self.repo, "resume", task["id"])
+        self.assertEqual(resumed["folder"], str(folder))
+        self.assertEqual(resumed["branch"], task["branch"])
+        self.assertEqual(resumed["state"], "open")
+        self.commit(folder, "second.txt", "second round\n", "Second round")
+        self.assertEqual(self.cli(self.repo, "merge", task["id"])["action"], "ready_to_merge")
+        self.assertEqual(self.cli(self.repo, "merge", task["id"], "--apply")["action"], "merged")
+        self.assertEqual((self.repo / "first.txt").read_text(encoding="utf-8"), "first round\n")
+        self.assertEqual((self.repo / "second.txt").read_text(encoding="utf-8"), "second round\n")
+        self.assertTrue(folder.is_dir())
+
+        reused = self.cli(self.repo, "start", "Grammar quiz")
+        self.assertEqual(reused["action"], "reused")
+        self.assertEqual(reused["folder"], str(folder))
+        self.assertEqual(reused["state"], "open")
+        self.assertEqual(len(self.cli(self.repo, "status")["tasks"]), 1)
+
+    def test_merge_detects_new_commits_without_an_explicit_resume(self) -> None:
+        task = self.cli(self.repo, "start", "Grammar quiz")
+        folder = Path(task["folder"])
+        self.commit(folder, "first.txt", "first round\n", "First round")
+        self.cli(self.repo, "merge", task["id"], "--apply")
+        self.commit(folder, "second.txt", "second round\n", "Second round")
+        self.assertEqual(self.cli(self.repo, "status")["tasks"][0]["state"], "open")
+        self.assertEqual(self.cli(self.repo, "merge", task["id"])["action"], "ready_to_merge")
+        self.assertEqual(self.cli(self.repo, "merge", task["id"], "--apply")["action"], "merged")
+        self.assertEqual((self.repo / "second.txt").read_text(encoding="utf-8"), "second round\n")
+
+    def test_merge_apply_refuses_a_branch_that_changed_after_preflight(self) -> None:
+        task = self.cli(self.repo, "start", "Grammar quiz")
+        folder = Path(task["folder"])
+        self.commit(folder, "first.txt", "first round\n", "First round")
+        spec = importlib.util.spec_from_file_location("traffic_control_merge_test", SCRIPT)
+        assert spec is not None and spec.loader is not None
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        real_preflight = helper.merge_preflight
+
+        def advance_after_preflight(root: Path, recorded_task: dict) -> dict:
+            plan = real_preflight(root, recorded_task)
+            self.commit(folder, "late.txt", "late work\n", "Late task change")
+            return plan
+
+        with patch.object(helper, "merge_preflight", side_effect=advance_after_preflight):
+            with self.assertRaises(helper.TrafficError) as caught:
+                helper.merge(argparse.Namespace(task=task["id"], apply=True), self.repo, self.repo / ".git")
+        self.assertIn("changed during the merge check", str(caught.exception))
+        self.assertFalse((self.repo / "first.txt").exists())
+        self.assertFalse((self.repo / "late.txt").exists())
+
+    def test_repeating_a_merge_without_new_work_does_not_make_a_commit(self) -> None:
+        task = self.cli(self.repo, "start", "Grammar quiz")
+        self.commit(Path(task["folder"]), "first.txt", "first round\n", "First round")
+        self.cli(self.repo, "merge", task["id"], "--apply")
+        before = self.git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(self.cli(self.repo, "merge", task["id"])["action"], "already_merged_in_git")
+        self.assertEqual(self.cli(self.repo, "merge", task["id"], "--apply")["action"], "reconciled")
+        self.assertEqual(self.git(self.repo, "rev-parse", "HEAD").stdout.strip(), before)
+        self.assertEqual(self.cli(self.repo, "status")["tasks"][0]["state"], "merged")
+
+    def test_older_merged_registry_detects_new_commits(self) -> None:
+        task = self.cli(self.repo, "start", "Grammar quiz")
+        folder = Path(task["folder"])
+        self.commit(folder, "first.txt", "first round\n", "First round")
+        self.cli(self.repo, "merge", task["id"], "--apply")
+        registry = self.repo / ".git" / "traffic-control.json"
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        del data["tasks"][task["id"]]["merged_branch_commit"]
+        registry.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(self.cli(self.repo, "status")["tasks"][0]["state"], "merged")
+        self.commit(folder, "second.txt", "second round\n", "Second round")
+        self.assertEqual(self.cli(self.repo, "status")["tasks"][0]["state"], "open")
+
     def test_merge_leaves_dirty_destination_untouched(self) -> None:
         task = self.cli(self.repo, "start", "Grammar quiz")
         self.commit(Path(task["folder"]), "quiz.txt", "quiz ready\n", "Add quiz")
@@ -220,7 +300,8 @@ class TrafficControlTests(GitFixture):
 
     def test_squash_merged_changes_are_reconciled_without_empty_merge_commit(self) -> None:
         task = self.cli(self.repo, "start", "Grammar quiz")
-        self.commit(Path(task["folder"]), "quiz.txt", "quiz ready\n", "Add quiz")
+        folder = Path(task["folder"])
+        self.commit(folder, "quiz.txt", "quiz ready\n", "Add quiz")
         self.git(self.repo, "merge", "--squash", task["branch"])
         self.git(self.repo, "commit", "-m", "Squash grammar quiz")
         before = self.git(self.repo, "rev-parse", "HEAD").stdout.strip()
@@ -229,7 +310,63 @@ class TrafficControlTests(GitFixture):
         self.assertEqual(reconciled["action"], "reconciled")
         self.assertEqual(reconciled["reason"], "changes_already_present")
         self.assertEqual(self.git(self.repo, "rev-parse", "HEAD").stdout.strip(), before)
+        self.assertEqual(self.git(self.repo, "merge-base", "--is-ancestor", "main", task["branch"]).returncode, 0)
         self.assertEqual(self.cli(self.repo, "status")["tasks"][0]["state"], "merged")
+        self.commit(folder, "quiz.txt", "quiz improved\n", "Continue quiz on the same line")
+        self.assertEqual(self.cli(self.repo, "status")["tasks"][0]["state"], "open")
+        self.assertEqual(self.cli(self.repo, "merge", task["id"])["action"], "ready_to_merge")
+        self.assertEqual(self.cli(self.repo, "merge", task["id"], "--apply")["action"], "merged")
+        self.assertEqual((self.repo / "quiz.txt").read_text(encoding="utf-8"), "quiz improved\n")
+
+    def test_squash_reconciliation_keeps_a_commit_added_during_alignment_open(self) -> None:
+        task = self.cli(self.repo, "start", "Grammar quiz")
+        folder = Path(task["folder"])
+        self.commit(folder, "quiz.txt", "quiz ready\n", "Add quiz")
+        self.git(self.repo, "merge", "--squash", task["branch"])
+        self.git(self.repo, "commit", "-m", "Squash grammar quiz")
+        before = self.git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        spec = importlib.util.spec_from_file_location("traffic_control_squash_race_test", SCRIPT)
+        assert spec is not None and spec.loader is not None
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        real_verify = helper.verify_merge_plan_current
+
+        def add_late_commit(root: Path, recorded_task: dict, plan: dict) -> None:
+            real_verify(root, recorded_task, plan)
+            self.commit(folder, "late.txt", "new work\n", "Commit during alignment")
+
+        with patch.object(helper, "verify_merge_plan_current", side_effect=add_late_commit):
+            with self.assertRaises(helper.TrafficError) as caught:
+                helper.merge(argparse.Namespace(task=task["id"], apply=True), self.repo, self.repo / ".git")
+        self.assertIn("changed while aligning", str(caught.exception))
+        self.assertEqual(self.git(self.repo, "rev-parse", "HEAD").stdout.strip(), before)
+        self.assertFalse((self.repo / "late.txt").exists())
+        self.assertEqual((folder / "late.txt").read_text(encoding="utf-8"), "new work\n")
+        self.assertEqual(self.cli(self.repo, "status")["tasks"][0]["state"], "open")
+        self.assertEqual(self.cli(self.repo, "merge", task["id"], "--apply")["action"], "merged")
+        self.assertEqual((self.repo / "late.txt").read_text(encoding="utf-8"), "new work\n")
+
+    def test_squash_reconciliation_detects_an_empty_commit_during_alignment(self) -> None:
+        task = self.cli(self.repo, "start", "Grammar quiz")
+        folder = Path(task["folder"])
+        self.commit(folder, "quiz.txt", "quiz ready\n", "Add quiz")
+        self.git(self.repo, "merge", "--squash", task["branch"])
+        self.git(self.repo, "commit", "-m", "Squash grammar quiz")
+        spec = importlib.util.spec_from_file_location("traffic_control_empty_race_test", SCRIPT)
+        assert spec is not None and spec.loader is not None
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        real_verify = helper.verify_merge_plan_current
+
+        def add_empty_commit(root: Path, recorded_task: dict, plan: dict) -> None:
+            real_verify(root, recorded_task, plan)
+            self.git(folder, "commit", "--allow-empty", "-m", "Concurrent empty commit")
+
+        with patch.object(helper, "verify_merge_plan_current", side_effect=add_empty_commit):
+            with self.assertRaises(helper.TrafficError) as caught:
+                helper.merge(argparse.Namespace(task=task["id"], apply=True), self.repo, self.repo / ".git")
+        self.assertIn("changed while aligning", str(caught.exception))
+        self.assertEqual(self.cli(self.repo, "status")["tasks"][0]["state"], "open")
 
 
 @unittest.skipIf(os.name == "nt", "managed preview uses POSIX process groups")
@@ -299,6 +436,12 @@ exec /bin/ps "$@"
         self.assertEqual(again["action"], "preview_running")
         self.assertEqual(again["url"], started["url"])
         self.assertEqual(self.cli(self.repo, "preview", task["id"], "--status", env=self.env)["action"], "preview_running")
+
+    def test_preview_can_start_after_merge_while_worktree_remains(self) -> None:
+        task = self.preview_task()
+        self.commit(Path(task["folder"]), "finished.txt", "ready\n", "Finish feature")
+        self.cli(self.repo, "merge", task["id"], "--apply")
+        self.assertEqual(self.cli(self.repo, "preview", task["id"], env=self.env)["action"], "preview_started")
 
     def test_parallel_previews_get_different_ports_and_stop_separately(self) -> None:
         first = self.preview_task()

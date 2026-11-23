@@ -29,7 +29,7 @@ When you are happy with a feature, say:
 
 > `$traffic-control merge "Grammar quiz"`
 
-It reviews the changes, runs the project's checks, and checks for merge problems before merging locally. It leaves the task folder in place. If your project uses GitHub pull requests, it follows that process instead.
+It reviews the changes, runs the project's checks, and checks for merge problems before merging locally. Merging brings the committed changes into your main branch and leaves the task folder in place. To keep working on the same task, continue in that folder or say `$traffic-control resume "Grammar quiz"` in a new conversation. When you have more changes ready, merge the task again. If your project uses GitHub pull requests, it follows that process instead.
 
 Traffic Control does not require a coordinator chat or a dashboard. It does not automatically read the contents of other conversations. Use a handoff note when moving work from one conversation to another.
 
@@ -54,11 +54,11 @@ The skill needs Git 2.38 or newer and Python 3.10 or newer. Git 2.38 added the c
 ## What happens behind the scenes
 
 - `start` uses the project's current linked worktree when there is one. Otherwise it creates a branch such as `traffic/grammar-quiz` and a sibling folder such as `perrito-traffic-control/grammar-quiz`. It fetches `origin` when available and starts from the default branch.
-- Repeating `start` with the same feature name returns its existing folder. An explicit parallel attempt gets another branch and folder.
+- Repeating `start` with the same feature name returns its existing folder, even after a merge. An explicit parallel attempt gets another branch and folder.
 - A small task list lives in the repository's Git metadata. It is shared by the repository's local worktrees and is not added to your source files.
 - `preview` currently recognizes npm projects whose dev script runs Vite. It installs dependencies in the task worktree when needed, chooses a free localhost port, waits for the server to respond, and records its process and log in local Git metadata. Repeating the command returns the existing link. `--stop` stops only the server Traffic Control started for that task.
-- `merge` first checks that the feature and destination have no uncommitted changes, the destination is current with its last fetched remote state, and Git sees no text conflicts. The read-only preview does not contact the network. `merge --apply` fetches `origin` and repeats those checks immediately before changing the destination. The skill runs your project's relevant checks before it applies a local merge.
-- If the work was already merged outside Traffic Control, including a squash merge with the same resulting files, `merge --apply` marks the task complete without making an empty merge commit.
+- `merge` first checks that the feature and destination have no uncommitted changes, the destination is current with its last fetched remote state, and Git sees no text conflicts. The read-only preview does not contact the network. `merge --apply` fetches `origin` and repeats those checks immediately before changing the destination. The skill runs your project's relevant checks before it applies a local merge. New commits in the same task folder can be merged again; repeating a merge without new changes makes no commit.
+- If the work was already merged outside Traffic Control, including a squash merge with the same resulting files, `merge --apply` records that result without changing the main branch. After a squash merge it also joins the task branch to main's history so later edits to the same files can merge correctly.
 - Traffic Control does not push, remove worktrees, rename other conversations, or overwrite uncommitted files.
 
 The helper can also be used directly from a terminal:

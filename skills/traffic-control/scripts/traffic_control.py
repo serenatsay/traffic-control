@@ -160,6 +160,25 @@ def task_view(task_id: str, task: dict[str, Any], path: Path) -> dict[str, Any]:
         changes = len(changed.stdout.splitlines()) if changed.returncode == 0 else None
     else:
         changes = None
+    state = task.get("state", "open")
+    if state == "merged":
+        if changes:
+            state = "open"
+        else:
+            branch_tip = git(path, "rev-parse", "--verify", f"{task['branch']}^{{commit}}", check=False)
+            if branch_tip.returncode == 0:
+                saved_tip = task.get("merged_branch_commit")
+                if saved_tip:
+                    if branch_tip.stdout.strip() != saved_tip:
+                        state = "open"
+                elif task.get("merged_commit"):
+                    # Older registries did not save the branch tip. Compare the
+                    # branch's contribution to the immutable merge checkpoint.
+                    checkpoint = task["merged_commit"]
+                    preview = git(path, "merge-tree", "--write-tree", checkpoint, branch_tip.stdout.strip(), check=False)
+                    checkpoint_tree = git(path, "rev-parse", f"{checkpoint}^{{tree}}", check=False)
+                    if preview.returncode or checkpoint_tree.returncode or not preview.stdout.splitlines() or preview.stdout.splitlines()[0].strip() != checkpoint_tree.stdout.strip():
+                        state = "open"
     return {
         "id": task_id,
         "title": task["title"],
@@ -169,7 +188,7 @@ def task_view(task_id: str, task: dict[str, Any], path: Path) -> dict[str, Any]:
         "folder": task["folder"],
         "branch": task["branch"],
         "target": task["target"],
-        "state": task.get("state", "open"),
+        "state": state,
         "changed_files": changes,
         "handoff": task.get("handoff", ""),
     }
@@ -203,20 +222,24 @@ def start(args: argparse.Namespace, root: Path, common: Path) -> dict[str, Any]:
         tasks = data["tasks"]
         matches = [(key, task) for key, task in tasks.items() if task["title"].casefold() == title.casefold()]
         if matches and not args.parallel:
-            open_matches = [(key, task) for key, task in matches if task.get("state") != "merged"]
-            if len(open_matches) == 1:
-                key, task = open_matches[0]
+            open_matches = [(key, task) for key, task in matches if task_view(key, task, root)["state"] != "merged"]
+            candidates = open_matches or matches
+            if len(candidates) == 1:
+                key, task = candidates[0]
                 verify_task_folder(root, task)
+                changed = task.get("state") == "merged"
+                if changed:
+                    task["state"] = "open"
                 if args.agent and args.agent != task.get("agent"):
                     agents = task.setdefault("agents", [task.get("agent", "unspecified")])
                     if args.agent not in agents:
                         agents.append(args.agent)
                     task["agent"] = args.agent
+                    changed = True
+                if changed:
                     save_registry(common, data)
                 return {"action": "reused", **task_view(key, task, root)}
-            if len(open_matches) > 1:
-                raise TrafficError("This feature has multiple active attempts. Use resume with its task ID.")
-            raise TrafficError("That task was already merged. Give the new work a distinct name.")
+            raise TrafficError("This feature has multiple attempts. Use resume with its task ID.")
         if args.parallel and not matches:
             raise TrafficError("There is no existing task to make a parallel attempt of. Start it normally first.")
 
@@ -285,9 +308,10 @@ def start(args: argparse.Namespace, root: Path, common: Path) -> dict[str, Any]:
 def resume(args: argparse.Namespace, root: Path, common: Path) -> dict[str, Any]:
     with locked_registry(common) as data:
         key, task = get_task(data, args.task)
-        if task.get("state") == "merged":
-            raise TrafficError("This task has already been merged.")
         verify_task_folder(root, task)
+        if task.get("state") == "merged":
+            task["state"] = "open"
+            save_registry(common, data)
         return {"action": "resumed", **task_view(key, task, root)}
 
 
@@ -303,8 +327,6 @@ def handoff(args: argparse.Namespace, root: Path, common: Path) -> dict[str, Any
         raise TrafficError("Write a short handoff note of at most 4,000 characters.")
     with locked_registry(common) as data:
         key, task = get_task(data, args.task)
-        if task.get("state") == "merged":
-            raise TrafficError("This task has already been merged.")
         task["handoff"] = note
         save_registry(common, data)
         return {"action": "handoff_saved", **task_view(key, task, root)}
@@ -329,46 +351,102 @@ def merge_preflight(root: Path, task: dict[str, Any]) -> dict[str, Any]:
     if git_ok(root, "show-ref", "--verify", f"refs/remotes/{remote_target}"):
         if not git_ok(root, "merge-base", "--is-ancestor", remote_target, target):
             raise TrafficError(f"Local '{target}' is behind or differs from '{remote_target}'. Update it before merging.")
-    if git_ok(root, "merge-base", "--is-ancestor", branch, target):
+    target_commit = git(root, "rev-parse", target).stdout.strip()
+    branch_commit = git(root, "rev-parse", branch).stdout.strip()
+    if git_ok(root, "merge-base", "--is-ancestor", branch_commit, target_commit):
         return {
             "already_merged": True,
             "target_folder": str(target_folder),
             "target": target,
             "branch": branch,
+            "target_commit": target_commit,
+            "branch_commit": branch_commit,
             "reason": "commit_in_history",
         }
-    preview = git(root, "merge-tree", "--write-tree", target, branch, check=False)
+    preview = git(root, "merge-tree", "--write-tree", target_commit, branch_commit, check=False)
     if preview.returncode == 1:
         raise TrafficError("These changes conflict with the destination branch. Resolve the overlap in the task folder first.")
     if preview.returncode:
         raise TrafficError("Git could not check this merge safely. A recent Git version with merge-tree --write-tree is needed.")
     merged_tree = preview.stdout.splitlines()[0].strip() if preview.stdout else ""
-    target_tree = git(root, "rev-parse", f"{target}^{{tree}}").stdout.strip()
+    target_tree = git(root, "rev-parse", f"{target_commit}^{{tree}}").stdout.strip()
     if merged_tree == target_tree:
         return {
             "already_merged": True,
             "target_folder": str(target_folder),
             "target": target,
             "branch": branch,
+            "target_commit": target_commit,
+            "branch_commit": branch_commit,
             "reason": "changes_already_present",
         }
-    return {"already_merged": False, "target_folder": str(target_folder), "target": target, "branch": branch}
+    return {"already_merged": False, "target_folder": str(target_folder), "target": target, "branch": branch, "target_commit": target_commit, "branch_commit": branch_commit}
+
+
+def verify_merge_plan_current(root: Path, task: dict[str, Any], plan: dict[str, Any]) -> None:
+    """Refuse to apply a plan if either branch or worktree changed since preflight."""
+    target_tip = git(root, "rev-parse", task["target"]).stdout.strip()
+    branch_tip = git(root, "rev-parse", task["branch"]).stdout.strip()
+    if target_tip != plan["target_commit"] or branch_tip != plan["branch_commit"]:
+        raise TrafficError("A branch changed during the merge check. Retry before changing either folder.")
+    for folder in (Path(task["folder"]), Path(plan["target_folder"])):
+        if git(folder, "status", "--porcelain").stdout.strip():
+            raise TrafficError("A folder changed during the merge check. Review its files before retrying.")
 
 
 def merge(args: argparse.Namespace, root: Path, common: Path) -> dict[str, Any]:
     with locked_registry(common) as data:
         key, task = get_task(data, args.task)
-        if task.get("state") == "merged":
-            return {"action": "already_merged", **task_view(key, task, root)}
         if args.apply and git_ok(root, "remote", "get-url", "origin"):
             fetched = git(root, "fetch", "origin", check=False)
             if fetched.returncode:
                 raise TrafficError("Could not check the latest remote changes. I did not merge anything.")
         plan = merge_preflight(root, task)
+        if args.apply:
+            verify_merge_plan_current(root, task, plan)
         if plan["already_merged"]:
             if args.apply:
+                if plan["reason"] == "changes_already_present":
+                    # Squash merges leave the task branch unrelated to the
+                    # destination's new commit. Join their histories in the
+                    # clean task worktree so later edits to the same lines
+                    # have the correct merge base. Main stays untouched.
+                    needs_alignment = not git_ok(root, "merge-base", "--is-ancestor", plan["target_commit"], plan["branch_commit"])
+                    if needs_alignment:
+                        task_folder = Path(task["folder"])
+                        aligned = git(task_folder, "merge", "--no-ff", "--no-edit", plan["target_commit"], check=False)
+                        if aligned.returncode:
+                            if git_ok(task_folder, "rev-parse", "--verify", "MERGE_HEAD"):
+                                aborted = git(task_folder, "merge", "--abort", check=False)
+                                if aborted.returncode:
+                                    raise TrafficError("Git could not finish or undo alignment of the task branch. Inspect its folder before retrying.")
+                            raise TrafficError("Git could not align the task branch after its squash merge. The destination was not changed.")
+                    aligned_tip = git(root, "rev-parse", task["branch"]).stdout.strip()
+                    aligned_tree = git(root, "rev-parse", f"{aligned_tip}^{{tree}}").stdout.strip()
+                    target_tree = git(root, "rev-parse", f"{plan['target_commit']}^{{tree}}").stdout.strip()
+                    parents = git(root, "rev-list", "--parents", "-n", "1", aligned_tip).stdout.strip().split()
+                    history_matches = (
+                        parents == [aligned_tip, plan["branch_commit"], plan["target_commit"]]
+                        if needs_alignment else aligned_tip == plan["branch_commit"]
+                    )
+                    if not history_matches or aligned_tree != target_tree:
+                        task["state"] = "open"
+                        save_registry(common, data)
+                        raise TrafficError("The task or destination changed while aligning their history. Main was not changed by Traffic Control; the task worktree and its new commits were kept. Run merge again.")
+                else:
+                    aligned_tip = plan["branch_commit"]
+                if (
+                    git(root, "rev-parse", task["target"]).stdout.strip() != plan["target_commit"]
+                    or git(root, "rev-parse", task["branch"]).stdout.strip() != aligned_tip
+                    or git(Path(task["folder"]), "status", "--porcelain").stdout.strip()
+                    or git(Path(plan["target_folder"]), "status", "--porcelain").stdout.strip()
+                ):
+                    task["state"] = "open"
+                    save_registry(common, data)
+                    raise TrafficError("The task or destination changed during reconciliation. Main was not changed by Traffic Control; the task worktree was kept. Run merge again.")
                 task["state"] = "merged"
-                task["merged_commit"] = git(root, "rev-parse", task["target"]).stdout.strip()
+                task["merged_commit"] = plan["target_commit"]
+                task["merged_branch_commit"] = aligned_tip
                 save_registry(common, data)
                 return {"action": "reconciled", **task_view(key, task, root), **plan}
             return {"action": "already_merged_in_git", **task_view(key, task, root), **plan}
@@ -376,7 +454,7 @@ def merge(args: argparse.Namespace, root: Path, common: Path) -> dict[str, Any]:
             return {"action": "ready_to_merge", **task_view(key, task, root), **plan}
         destination = Path(plan["target_folder"])
         before = git(destination, "rev-parse", "HEAD").stdout.strip()
-        result = git(destination, "merge", "--no-ff", "--no-edit", task["branch"], check=False)
+        result = git(destination, "merge", "--no-ff", "--no-edit", "-m", f"Merge branch '{task['branch']}'", plan["branch_commit"], check=False)
         if result.returncode:
             if git_ok(destination, "rev-parse", "--verify", "MERGE_HEAD"):
                 aborted = git(destination, "merge", "--abort", check=False)
@@ -386,6 +464,7 @@ def merge(args: argparse.Namespace, root: Path, common: Path) -> dict[str, Any]:
         after = git(destination, "rev-parse", "HEAD").stdout.strip()
         task["state"] = "merged"
         task["merged_commit"] = after
+        task["merged_branch_commit"] = plan["branch_commit"]
         save_registry(common, data)
         return {"action": "merged", **task_view(key, task, root), "previous_commit": before, "merged_commit": after}
 
@@ -599,8 +678,6 @@ def preview(args: argparse.Namespace, root: Path, common: Path) -> dict[str, Any
     with locked_registry(common) as registry:
         key, task = get_task(registry, args.task)
         task = dict(task)
-    if task.get("state") == "merged" and not (args.stop or args.status):
-        raise TrafficError("This task has already been merged. Stop its old preview or start a new task.")
     folder = Path(task["folder"])
     if not (args.stop or args.status):
         folder = verify_task_folder(root, task)
@@ -673,9 +750,9 @@ def render(result: dict[str, Any]) -> str:
     elif result["action"] == "ready_to_merge":
         lines.append(f"Ready to merge into {result['target']} after project checks pass. No files were changed.")
     elif result["action"] == "merged":
-        lines.append(f"Merged locally into {result['target']}. The task folder remains available.")
+        lines.append(f"Merged locally into {result['target']}. The task folder remains available; resume it to keep working.")
     elif result["action"] == "reconciled":
-        lines.append(f"These changes were already on {result['target']}; no new merge commit was made.")
+        lines.append(f"These changes were already on {result['target']}; the destination branch was not changed.")
     elif result["action"].startswith("already_merged"):
         lines.append("These changes are already on the destination branch.")
     if result.get("handoff"):
