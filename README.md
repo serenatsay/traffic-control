@@ -10,24 +10,24 @@ I found myself opening multiple coding chats in Claude Code and Codex for the sa
 
 In Claude Code, say:
 
-> `/traffic-control start "Add a grammar quiz"`
+> `/traffic-control start "Grammar quiz"`
 
 In Codex, say:
 
-> `$traffic-control start "Add a grammar quiz"`
+> `$traffic-control start "Grammar quiz"`
 
 
 The skill tells you which folder to open for the coding conversation and suggests the same name for the chat. Ask it to **resume** a feature when opening another conversation about it. It reuses the same folder for sequential work. Ask it to **start a parallel attempt** only when two agents will edit at the same time or try different solutions.
 
 To see that task in your browser, say:
 
-> `$traffic-control preview "Add a grammar quiz"`
+> `$traffic-control preview "Grammar quiz"`
 
-Traffic Control sets up that task's folder, starts its dev server, and gives you a link such as `http://127.0.0.1:5173/`. A second task gets a different link. You can ask for `preview "Add a grammar quiz" --status` to find the link again or `preview "Add a grammar quiz" --stop` when you are done. In Claude Code, use `/traffic-control` instead of `$traffic-control`. Previews start only when you ask for them.
+Traffic Control sets up that task's folder, starts its dev server, and gives you a link such as `http://127.0.0.1:5173/`. A second task gets a different link. You can ask for `preview "Grammar quiz" --status` to find the link again or `preview "Grammar quiz" --stop` when you are done. In Claude Code, use `/traffic-control` instead of `$traffic-control`. Previews start only when you ask for them.
 
 When you are happy with a feature, say:
 
-> `$traffic-control merge "Add a grammar quiz"`
+> `$traffic-control merge "Grammar quiz"`
 
 It reviews the changes, runs the project's checks, and checks for merge problems before merging locally. It leaves the task folder in place. If your project uses GitHub pull requests, it follows that process instead.
 
@@ -53,7 +53,7 @@ The skill needs Git 2.38 or newer and Python 3.10 or newer. Git 2.38 added the c
 
 ## What happens behind the scenes
 
-- `start` uses the project's current linked worktree when there is one. Otherwise it creates a branch such as `traffic/add-a-grammar-quiz` and a sibling folder such as `perrito-traffic-control/add-a-grammar-quiz`. It fetches `origin` when available and starts from the default branch.
+- `start` uses the project's current linked worktree when there is one. Otherwise it creates a branch such as `traffic/grammar-quiz` and a sibling folder such as `perrito-traffic-control/grammar-quiz`. It fetches `origin` when available and starts from the default branch.
 - Repeating `start` with the same feature name returns its existing folder. An explicit parallel attempt gets another branch and folder.
 - A small task list lives in the repository's Git metadata. It is shared by the repository's local worktrees and is not added to your source files.
 - `preview` currently recognizes npm projects whose dev script runs Vite. It installs dependencies in the task worktree when needed, chooses a free localhost port, waits for the server to respond, and records its process and log in local Git metadata. Repeating the command returns the existing link. `--stop` stops only the server Traffic Control started for that task.
@@ -64,12 +64,12 @@ The skill needs Git 2.38 or newer and Python 3.10 or newer. Git 2.38 added the c
 The helper can also be used directly from a terminal:
 
 ```sh
-python3 skills/traffic-control/scripts/traffic_control.py start "Add a grammar quiz"
+python3 skills/traffic-control/scripts/traffic_control.py start "Grammar quiz"
 python3 skills/traffic-control/scripts/traffic_control.py status
-python3 skills/traffic-control/scripts/traffic_control.py resume "Add a grammar quiz"
-python3 skills/traffic-control/scripts/traffic_control.py preview "Add a grammar quiz"
-python3 skills/traffic-control/scripts/traffic_control.py preview "Add a grammar quiz" --stop
-python3 skills/traffic-control/scripts/traffic_control.py merge "Add a grammar quiz"
+python3 skills/traffic-control/scripts/traffic_control.py resume "Grammar quiz"
+python3 skills/traffic-control/scripts/traffic_control.py preview "Grammar quiz"
+python3 skills/traffic-control/scripts/traffic_control.py preview "Grammar quiz" --stop
+python3 skills/traffic-control/scripts/traffic_control.py merge "Grammar quiz"
 ```
 
 Run those commands from inside the project you want to work on. `merge` without `--apply` only checks readiness.
