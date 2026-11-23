@@ -7,13 +7,19 @@ import argparse
 import json
 import os
 import re
+import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.error import URLError
+from urllib.request import urlopen
 
 
 class TrafficError(Exception):
@@ -384,11 +390,273 @@ def merge(args: argparse.Namespace, root: Path, common: Path) -> dict[str, Any]:
         return {"action": "merged", **task_view(key, task, root), "previous_commit": before, "merged_commit": after}
 
 
+@contextmanager
+def preview_lock(common: Path) -> Iterator[None]:
+    """Serialize port allocation and preview state changes across conversations."""
+    with (common / "traffic-control-preview.lock").open("a+b") as lock_file:
+        if os.name == "nt":
+            raise TrafficError("Managed previews currently need macOS or Linux.")
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def process_identity(pid: int) -> str | None:
+    """A PID and its OS start time identify the server group we created."""
+    if pid < 1:
+        return None
+    try:
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart=", "-o", "stat="], capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    parts = result.stdout.strip().split()
+    if result.returncode or len(parts) < 6 or parts[-1].startswith("Z"):
+        return None
+    return " ".join(parts[:-1])
+
+
+def pid_running(pid: int) -> bool:
+    """Treat a live PID with an unknown identity as unsafe to replace or stop."""
+    if pid < 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        status = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True, check=False)
+    except OSError:
+        return True
+    if status.returncode:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    return not status.stdout.strip().startswith("Z")
+
+
+def saved_pid(data: dict[str, Any]) -> int:
+    try:
+        return int(data.get("pid", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def preview_paths(common: Path, key: str) -> tuple[Path, Path]:
+    folder = common / "traffic-control-previews"
+    folder.mkdir(exist_ok=True)
+    return folder / f"{key}.json", folder / f"{key}.log"
+
+
+def read_preview(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("version") != 1:
+            raise ValueError("unsupported preview state")
+        return data
+    except (OSError, ValueError) as exc:
+        raise TrafficError("The saved preview state cannot be read. Inspect it before starting another preview.") from exc
+
+
+def save_preview(path: Path, data: dict[str, Any]) -> None:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix="preview-", delete=False) as out:
+        temp_path = Path(out.name)
+        json.dump(data, out, indent=2, sort_keys=True)
+        out.write("\n")
+    os.replace(temp_path, path)
+
+
+def preview_alive(data: dict[str, Any], task: dict[str, Any]) -> bool:
+    try:
+        pid = int(data["pid"])
+        return (
+            data.get("folder") == task["folder"]
+            and data.get("branch") == task["branch"]
+            and process_identity(pid) == data.get("identity")
+            and os.getpgid(pid) == pid
+        )
+    except (KeyError, ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+def url_ready(port: int) -> bool:
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/", timeout=0.5) as response:
+            return 200 <= response.status < 500
+    except (OSError, URLError):
+        return False
+
+
+def free_port() -> int:
+    # Use familiar Vite ports so URLs are easy to recognize. The lock prevents
+    # two Traffic Control calls from choosing the same port at once.
+    for port in range(5173, 5273):
+        with socket.socket() as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise TrafficError("No free preview port was found. Stop an old preview and try again.")
+
+
+def prepare_vite(folder: Path) -> None:
+    manifest = folder / "package.json"
+    try:
+        package = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise TrafficError("I could not find a readable package.json in this task folder.") from exc
+    scripts = package.get("scripts", {}) if isinstance(package, dict) else {}
+    dev = scripts.get("dev", "") if isinstance(scripts, dict) else ""
+    if not isinstance(dev, str) or not re.fullmatch(r"\s*vite(?:\s+[^;&|]*)?\s*", dev):
+        raise TrafficError("Automatic preview currently supports Vite projects with an npm dev script. Use your app's built-in preview for this project.")
+    if (folder / "pnpm-lock.yaml").exists() or (folder / "yarn.lock").exists() or (folder / "bun.lockb").exists() or (folder / "bun.lock").exists():
+        raise TrafficError("This project uses a package manager other than npm. Use your app's built-in preview for now.")
+    if not shutil.which("npm"):
+        raise TrafficError("npm is not installed or is not available in this conversation's environment.")
+    if not (folder / "node_modules" / ".bin" / "vite").exists():
+        install = ["npm", "ci"] if (folder / "package-lock.json").exists() else ["npm", "install", "--no-package-lock"]
+        try:
+            completed = subprocess.run(install, cwd=folder, capture_output=True, text=True, timeout=300, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise TrafficError(f"Could not install this worktree's dependencies: {exc}") from exc
+        if completed.returncode:
+            detail = (completed.stderr or completed.stdout).strip().splitlines()
+            raise TrafficError(f"Could not install this worktree's dependencies: {detail[-1] if detail else 'npm failed'}")
+
+
+def stop_preview(data: dict[str, Any], task: dict[str, Any]) -> bool:
+    if not preview_alive(data, task):
+        return False
+    pid = int(data["pid"])
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError as exc:
+        raise TrafficError("I could not stop this preview process. Inspect it before retrying.") from exc
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not pid_running(pid):
+            return True
+        if not preview_alive(data, task):
+            if not pid_running(pid):
+                return True
+            raise TrafficError("The saved preview process changed while stopping. I kept its record for inspection.")
+        time.sleep(0.1)
+    if preview_alive(data, task):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return True
+        except PermissionError as exc:
+            raise TrafficError("I could not finish stopping this preview process. Inspect it before retrying.") from exc
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if not pid_running(pid):
+            return True
+        time.sleep(0.1)
+    raise TrafficError("The preview process is still running. I kept its record for inspection.")
+
+
+def terminate_spawned(process: subprocess.Popen[bytes]) -> None:
+    """Clean up a process we just created even if its identity was unreadable."""
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        raise TrafficError("I could not stop the new preview process. Inspect running processes before retrying.") from exc
+    try:
+        process.wait(timeout=3)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        raise TrafficError("The new preview process did not stop. Inspect running processes before retrying.")
+
+
+def preview(args: argparse.Namespace, root: Path, common: Path) -> dict[str, Any]:
+    with locked_registry(common) as registry:
+        key, task = get_task(registry, args.task)
+        task = dict(task)
+    if task.get("state") == "merged" and not (args.stop or args.status):
+        raise TrafficError("This task has already been merged. Stop its old preview or start a new task.")
+    folder = Path(task["folder"])
+    if not (args.stop or args.status):
+        folder = verify_task_folder(root, task)
+    with preview_lock(common):
+        state_path, log_path = preview_paths(common, key)
+        state = read_preview(state_path)
+        running = state is not None and preview_alive(state, task)
+        if state is not None and not running and pid_running(saved_pid(state)):
+            raise TrafficError(f"The saved preview process no longer matches this task. I kept its record at {state_path}; inspect it before retrying.")
+        if args.status:
+            return {"action": "preview_running" if running else "preview_stopped", "title": task["title"], "folder": str(folder), "url": state["url"] if running else None}
+        if args.stop:
+            if running:
+                stop_preview(state, task)
+            state_path.unlink(missing_ok=True)
+            return {"action": "preview_stopped", "title": task["title"], "folder": str(folder), "url": None}
+        if running:
+            return {"action": "preview_running", "title": task["title"], "folder": str(folder), "url": state["url"]}
+        # A stale state is only replaced after preparation succeeds. Never signal
+        # a process if its stored PID identity no longer matches.
+        prepare_vite(folder)
+        port = free_port()
+        command = ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", str(port), "--strictPort"]
+        try:
+            with log_path.open("ab") as log:
+                log.write(f"\nTraffic Control preview for {task['title']} on port {port}\n".encode())
+                log.flush()
+                process = subprocess.Popen(command, cwd=folder, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as exc:
+            raise TrafficError(f"Could not start the preview server: {exc}") from exc
+        identity = process_identity(process.pid)
+        if not identity:
+            terminate_spawned(process)
+            raise TrafficError("The preview server exited immediately. Check its dev script and try again.")
+        state = {"version": 1, "pid": process.pid, "identity": identity, "folder": str(folder), "branch": task["branch"], "port": port, "url": f"http://127.0.0.1:{port}/"}
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            if url_ready(port):
+                save_preview(state_path, state)
+                return {"action": "preview_started", "title": task["title"], "folder": str(folder), "url": state["url"]}
+            time.sleep(0.2)
+        terminate_spawned(process)
+        raise TrafficError(f"The preview server did not become ready. Its log is at {log_path}.")
+
+
 def render(result: dict[str, Any]) -> str:
     if result["action"] == "status":
         if not result["tasks"]:
             return "Traffic Control has no recorded tasks in this project."
         return "\n\n".join(render({"action": "listed", **task}) for task in result["tasks"])
+    if result["action"].startswith("preview_"):
+        if result["action"] == "preview_stopped":
+            return f"Preview for {result['title']} is stopped."
+        return f"Preview for {result['title']}: {result['url']}\nWorktree: {result['folder']}"
     lines = [f"{result['title']} — {result.get('state', 'open')}"]
     if result["action"] in {"created", "adopted", "reused", "resumed", "listed"}:
         lines.append(f"Folder: {result['folder']}")
@@ -440,6 +708,12 @@ def parse_args() -> argparse.Namespace:
     merge_parser = sub.add_parser("merge", help="Check or apply a local merge")
     merge_parser.add_argument("task", help="Feature name or task ID")
     merge_parser.add_argument("--apply", action="store_true", help="Perform the merge after checks")
+
+    preview_parser = sub.add_parser("preview", help="Start, check, or stop a task's local Vite dev server")
+    preview_parser.add_argument("task", help="Feature name or task ID")
+    preview_mode = preview_parser.add_mutually_exclusive_group()
+    preview_mode.add_argument("--status", action="store_true", help="Check whether the preview is running")
+    preview_mode.add_argument("--stop", action="store_true", help="Stop this task's preview")
     return parser.parse_args()
 
 
@@ -448,7 +722,7 @@ def main() -> int:
     try:
         root = repo_root(args.repo.resolve())
         common = common_git_dir(root)
-        handlers = {"start": start, "resume": resume, "status": status, "handoff": handoff, "merge": merge}
+        handlers = {"start": start, "resume": resume, "status": status, "handoff": handoff, "merge": merge, "preview": preview}
         result = handlers[args.command](args, root, common)
     except TrafficError as exc:
         if args.json:

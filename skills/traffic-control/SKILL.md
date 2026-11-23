@@ -1,6 +1,6 @@
 ---
 name: traffic-control
-description: Start, resume, hand off, and merge coding tasks across Codex and Claude Code using named Git worktrees. Use when a user wants a separate coding conversation or wants to land its changes.
+description: Start, resume, preview, hand off, and merge coding tasks across Codex and Claude Code using named Git worktrees. Use when a user wants a separate coding conversation, a local test link, or wants to land its changes.
 ---
 
 # Traffic Control
@@ -19,6 +19,10 @@ Keep each active coding task in a known folder and branch. The user supplies a p
 ## Handoff between conversations
 
 When the user is moving a feature to another conversation, summarize completed work, remaining work, and any important test result in a short note. Save it with `handoff "<task>" --note "<summary>"`. In the next conversation, call `resume` and use its handoff note. Files carry across conversations only when they open the same folder; chat history does not.
+
+## Preview the task
+
+When the user asks to test a task in the browser, run `preview "<task name or ID>"` with the bundled helper and give them its local URL. The helper runs in the recorded worktree even if this conversation is in another folder. It installs npm dependencies in that worktree if missing, starts its Vite dev server on a free localhost port, and reuses an already running preview. Ask for a specific task ID if multiple attempts share a name. Use `preview "<task>" --status` to check it and `preview "<task>" --stop` when the user is done. Do not start a server automatically for every new task; several open servers consume resources. If startup fails, read the log path in the helper's error and explain the cause in plain language. If the helper reports an unsupported project, explain that this version only manages npm/Vite previews and help the user use the project's existing dev command or the app's preview feature. Do not claim a URL is ready until the helper confirms it.
 
 ## Merge
 

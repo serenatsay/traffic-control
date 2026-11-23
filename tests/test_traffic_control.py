@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "skills" / "traffic-control" / "scripts" / "traffic_control.py"
 
 
-class TrafficControlTests(unittest.TestCase):
+class GitFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -33,12 +39,13 @@ class TrafficControlTests(unittest.TestCase):
             self.fail(f"git {' '.join(args)} failed: {result.stderr}")
         return result
 
-    def cli(self, folder: Path, *args: str, success: bool = True) -> dict:
+    def cli(self, folder: Path, *args: str, success: bool = True, env: dict[str, str] | None = None) -> dict:
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "--repo", str(folder), "--json", *args],
             capture_output=True,
             text=True,
             check=False,
+            env=env,
         )
         try:
             payload = json.loads(result.stdout)
@@ -54,6 +61,9 @@ class TrafficControlTests(unittest.TestCase):
         (folder / filename).write_text(content, encoding="utf-8")
         self.git(folder, "add", filename)
         self.git(folder, "commit", "-m", message)
+
+
+class TrafficControlTests(GitFixture):
 
     def test_start_reuses_feature_across_conversations(self) -> None:
         first = self.cli(self.repo, "start", "Grammar quiz", "--agent", "codex")
@@ -220,6 +230,170 @@ class TrafficControlTests(unittest.TestCase):
         self.assertEqual(reconciled["reason"], "changes_already_present")
         self.assertEqual(self.git(self.repo, "rev-parse", "HEAD").stdout.strip(), before)
         self.assertEqual(self.cli(self.repo, "status")["tasks"][0]["state"], "merged")
+
+
+@unittest.skipIf(os.name == "nt", "managed preview uses POSIX process groups")
+class PreviewTests(GitFixture):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "package.json").write_text('{"scripts":{"dev":"vite"}}\n', encoding="utf-8")
+        (self.repo / "package-lock.json").write_text('{}\n', encoding="utf-8")
+        (self.repo / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        self.git(self.repo, "add", "package.json", "package-lock.json", ".gitignore")
+        self.git(self.repo, "commit", "-m", "Add Vite app")
+        bindir = self.base / "bin"
+        bindir.mkdir()
+        npm = bindir / "npm"
+        npm.write_text("""#!/usr/bin/env python3
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+if sys.argv[1] == 'ci':
+    marker = Path('node_modules/.bin/vite')
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('fake vite')
+    sys.exit(0)
+if os.environ.get('FAKE_NPM_FAIL'):
+    sys.exit(1)
+if os.environ.get('FAKE_NPM_PID_FILE'):
+    Path(os.environ['FAKE_NPM_PID_FILE']).write_text(str(os.getpid()))
+port = int(sys.argv[sys.argv.index('--port') + 1])
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'preview ready')
+    def log_message(self, *args):
+        pass
+HTTPServer(('127.0.0.1', port), Handler).serve_forever()
+""", encoding="utf-8")
+        npm.chmod(0o755)
+        ps = bindir / "ps"
+        ps.write_text("""#!/bin/sh
+if [ -n "$FAKE_PS_FAIL" ]; then
+    count=0
+    while [ ! -f "$FAKE_NPM_PID_FILE" ] && [ "$count" -lt 50 ]; do
+        sleep 0.02
+        count=$((count + 1))
+    done
+    exit 1
+fi
+exec /bin/ps "$@"
+""", encoding="utf-8")
+        ps.chmod(0o755)
+        self.env = {**os.environ, "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+
+    def preview_task(self, name: str = "Grammar quiz") -> dict:
+        task = self.cli(self.repo, "start", name)
+        self.addCleanup(lambda: self.cli(self.repo, "preview", task["id"], "--stop", env=self.env))
+        return task
+
+    def test_preview_installs_in_worktree_and_reuses_running_server(self) -> None:
+        task = self.preview_task()
+        started = self.cli(self.repo, "preview", task["id"], env=self.env)
+        self.assertEqual(started["action"], "preview_started")
+        self.assertTrue((Path(task["folder"]) / "node_modules" / ".bin" / "vite").exists())
+        self.assertFalse((self.repo / "node_modules").exists())
+        again = self.cli(self.repo, "preview", task["id"], env=self.env)
+        self.assertEqual(again["action"], "preview_running")
+        self.assertEqual(again["url"], started["url"])
+        self.assertEqual(self.cli(self.repo, "preview", task["id"], "--status", env=self.env)["action"], "preview_running")
+
+    def test_parallel_previews_get_different_ports_and_stop_separately(self) -> None:
+        first = self.preview_task()
+        second = self.cli(self.repo, "start", "Grammar quiz", "--parallel")
+        self.addCleanup(lambda: self.cli(self.repo, "preview", second["id"], "--stop", env=self.env))
+        one = self.cli(self.repo, "preview", first["id"], env=self.env)
+        two = self.cli(self.repo, "preview", second["id"], env=self.env)
+        self.assertNotEqual(one["url"], two["url"])
+        self.cli(self.repo, "preview", first["id"], "--stop", env=self.env)
+        first_port = int(one["url"].split(":")[-1].rstrip("/"))
+        with socket.socket() as probe:
+            self.assertNotEqual(probe.connect_ex(("127.0.0.1", first_port)), 0)
+        self.assertEqual(self.cli(self.repo, "preview", second["id"], "--status", env=self.env)["action"], "preview_running")
+
+    def test_preview_skips_an_occupied_port(self) -> None:
+        task = self.preview_task()
+        with socket.socket() as occupied:
+            try:
+                occupied.bind(("127.0.0.1", 5173))
+            except OSError:
+                self.skipTest("port 5173 is already occupied")
+            started = self.cli(self.repo, "preview", task["id"], env=self.env)
+        self.assertNotEqual(started["url"], "http://127.0.0.1:5173/")
+
+    def test_stale_identity_is_not_signalled(self) -> None:
+        task = self.preview_task()
+        self.cli(self.repo, "preview", task["id"], env=self.env)
+        state = self.repo / ".git" / "traffic-control-previews" / f"{task['id']}.json"
+        data = json.loads(state.read_text(encoding="utf-8"))
+        data["identity"] = "old process"
+        state.write_text(json.dumps(data), encoding="utf-8")
+        pid = int(data["pid"])
+        try:
+            blocked = self.cli(self.repo, "preview", task["id"], "--stop", success=False, env=self.env)
+            self.assertIn("no longer matches", blocked["error"])
+            self.assertTrue(state.exists())
+            os.kill(pid, 0)
+        finally:
+            # We know this PID came from this test. The helper correctly refused
+            # to signal it after the saved identity was changed.
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        for _ in range(30):
+            state_now = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True, check=False)
+            if state_now.returncode or state_now.stdout.strip().startswith("Z"):
+                break
+            time.sleep(0.1)
+        self.assertEqual(self.cli(self.repo, "preview", task["id"], "--status", env=self.env)["action"], "preview_stopped")
+        self.cli(self.repo, "preview", task["id"], "--stop", env=self.env)
+
+    def test_status_and_stop_work_after_merged_worktree_removed(self) -> None:
+        task = self.preview_task()
+        self.cli(self.repo, "preview", task["id"], env=self.env)
+        folder = Path(task["folder"])
+        self.commit(folder, "finished.txt", "ready\n", "Finish feature")
+        self.cli(self.repo, "merge", task["id"], "--apply")
+        self.git(self.repo, "worktree", "remove", "--force", str(folder))
+        self.assertEqual(self.cli(self.repo, "preview", task["id"], "--status", env=self.env)["action"], "preview_running")
+        self.assertEqual(self.cli(self.repo, "preview", task["id"], "--stop", env=self.env)["action"], "preview_stopped")
+
+    def test_missing_process_identity_does_not_leak_new_server(self) -> None:
+        task = self.preview_task()
+        pid_file = self.base / "preview.pid"
+        env = {**self.env, "FAKE_PS_FAIL": "1", "FAKE_NPM_PID_FILE": str(pid_file)}
+        failed = self.cli(self.repo, "preview", task["id"], success=False, env=env)
+        self.assertIn("exited immediately", failed["error"])
+        self.assertTrue(pid_file.exists(), "The mock server should have started before process inspection failed")
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertEqual(self.cli(self.repo, "preview", task["id"], "--status", env=self.env)["action"], "preview_stopped")
+
+    def test_exit_between_check_and_signal_is_a_clean_stop(self) -> None:
+        spec = importlib.util.spec_from_file_location("traffic_control_under_test", SCRIPT)
+        assert spec and spec.loader
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        with patch.object(helper, "preview_alive", return_value=True), patch.object(helper.os, "killpg", side_effect=ProcessLookupError):
+            self.assertTrue(helper.stop_preview({"pid": 12345}, {}))
+
+    def test_failed_dev_command_does_not_claim_a_running_preview(self) -> None:
+        task = self.preview_task()
+        failed = self.cli(self.repo, "preview", task["id"], success=False, env={**self.env, "FAKE_NPM_FAIL": "1"})
+        self.assertIn("exited immediately", failed["error"])
+        self.assertEqual(self.cli(self.repo, "preview", task["id"], "--status", env=self.env)["action"], "preview_stopped")
+
+    def test_unsupported_dev_script_is_not_started(self) -> None:
+        (self.repo / "package.json").write_text('{"scripts":{"dev":"next dev"}}\n', encoding="utf-8")
+        self.git(self.repo, "add", "package.json")
+        self.git(self.repo, "commit", "-m", "Switch dev server")
+        task = self.preview_task()
+        failed = self.cli(self.repo, "preview", task["id"], success=False, env=self.env)
+        self.assertIn("supports Vite", failed["error"])
 
 
 if __name__ == "__main__":
