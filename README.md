@@ -4,17 +4,18 @@ Traffic Control keeps parallel Codex and Claude Code tasks in separate folders a
 
 ## Why I made this
 
-I found myself opening multiple coding chats in Claude Code and Codex for the same project. Once several were going, it was hard to remember where each set of changes lived and how to bring them back together. Traffic Control gives each task a name and its own place to work, then helps me merge it when it's ready.
+I found myself opening multiple coding chats in Claude Code and Codex for the same project... sometimes with overlapping code (bad practice, I know). Once several were going, it was hard to remember where each set of changes lived and how to bring them back together. Traffic Control gives each task a name and its own place to work, then helps you merge it when ready.
 
 ## Use it
+
+In Claude Code, say:
+
+> `/traffic-control start "Add a grammar quiz"`
 
 In Codex, say:
 
 > `$traffic-control start "Add a grammar quiz"`
 
-In Claude Code, say:
-
-> `/traffic-control start "Add a grammar quiz"`
 
 The skill tells you which folder to open for the coding conversation and suggests the same name for the chat. Ask it to **resume** a feature when opening another conversation about it. It reuses the same folder for sequential work. Ask it to **start a parallel attempt** only when two agents will edit at the same time or try different solutions.
 
